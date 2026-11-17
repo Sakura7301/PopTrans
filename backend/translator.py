@@ -1607,31 +1607,35 @@ class Translator:
 
             glossary = _read_glossary()
             chunks, split = _split_long_text(text)
-            for index, chunk in enumerate(chunks):
-                if split and index > 0:
-                    yield "\n"
-                prompt = build_translation_prompt(
-                    target_code, chunk, normalized_source, glossary
-                )
-                prompt_tokens = estimate_tokens(prompt)
-                max_tokens = max(
-                    64,
-                    min(OUTPUT_MAX_TOKENS, MODEL_N_CTX - prompt_tokens - SAFETY_MARGIN_TOKENS),
-                )
-                response_stream = self._model.create_chat_completion(
-                    messages=[{"role": "user", "content": prompt}],
-                    stream=True,
-                    max_tokens=max_tokens,
-                    **GENERATION_CONFIG,
-                )
-
+            # Hold the inference lock for the whole logical stream: the model is
+            # not re-entrant, and this also guarantees all chunks of a long
+            # stream are emitted (an earlier indentation bug only consumed the
+            # last chunk).
             with self._infer_lock:
-                for chunk in response_stream:
-                    if "choices" in chunk and len(chunk["choices"]) > 0:
-                        delta = chunk["choices"][0].get("delta", {})
-                        content = delta.get("content")
-                        if content:
-                            yield content
+                for index, chunk in enumerate(chunks):
+                    if split and index > 0:
+                        yield "\n"
+                    prompt = build_translation_prompt(
+                        target_code, chunk, normalized_source, glossary
+                    )
+                    prompt_tokens = estimate_tokens(prompt)
+                    max_tokens = max(
+                        64,
+                        min(OUTPUT_MAX_TOKENS, MODEL_N_CTX - prompt_tokens - SAFETY_MARGIN_TOKENS),
+                    )
+                    response_stream = self._model.create_chat_completion(
+                        messages=[{"role": "user", "content": prompt}],
+                        stream=True,
+                        max_tokens=max_tokens,
+                        **GENERATION_CONFIG,
+                    )
+
+                    for part in response_stream:
+                        if "choices" in part and len(part["choices"]) > 0:
+                            delta = part["choices"][0].get("delta", {})
+                            content = delta.get("content")
+                            if content:
+                                yield content
 
         except Exception as e:
             logger.exception(f"流式翻译失败: {text[:30]}...")

@@ -7,7 +7,7 @@ from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from backend.ocr_service import OCRService
 from backend.runtime_paths import log_path, settings_path
@@ -75,6 +75,45 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Translate API", lifespan=lifespan)
 
+MAX_UPLOAD_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _open_uploaded_image(file: UploadFile) -> Image.Image:
+    """Validate an image upload, enforce size bounds, and normalize PIL mode."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = file.file.read(64 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Image file exceeds {MAX_UPLOAD_IMAGE_BYTES // (1024 * 1024)}MB limit",
+            )
+        chunks.append(chunk)
+
+    content = b"".join(chunks)
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty image file")
+
+    try:
+        image = Image.open(io.BytesIO(content))
+        image.load()
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid or corrupted image file") from exc
+
+    if image.mode not in ("L", "RGB", "RGBA"):
+        image = image.convert("RGB")
+    return image
+
+
+def _require_image_content_type(file: UploadFile) -> None:
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Must be an image file")
+
+
 @app.get("/health")
 def health_check():
     """检查模型是否准备就绪"""
@@ -96,37 +135,32 @@ def recognize_ocr(
     source_lang: Optional[str] = Form(None),
 ):
     """接收图片并进行 OCR 识别（source_lang=ko 时使用韩语识别模型）"""
-    if not (file.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=400, detail="Must be an image file")
+    _require_image_content_type(file)
     try:
         normalize_source_language(source_lang)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
     try:
-        content = file.file.read()
-        image = Image.open(io.BytesIO(content))
-        # 确保图片格式正确，且不受限于 RGBA 问题
-        if image.mode not in ("L", "RGB", "RGBA"):
-            image = image.convert("RGB")
-            
+        image = _open_uploaded_image(file)
         result = ocr_engine.recognize_image(
             image, allow_retry=allow_retry, source_lang=source_lang
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("OCR 处理异常")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/ocr_translate")
-async def recognize_and_translate_ocr(
+def recognize_and_translate_ocr(
     file: UploadFile = File(...),
     target_lang: Optional[str] = Form(None),
     source_lang: Optional[str] = Form(None),
 ):
     """接收图片，OCR 识别后直接翻译并返回。"""
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Must be an image file")
+    _require_image_content_type(file)
     try:
         normalize_target_language(target_lang)
         normalize_source_language(source_lang)
@@ -136,11 +170,7 @@ async def recognize_and_translate_ocr(
         raise HTTPException(status_code=503, detail="Translator model is loading or not ready.")
 
     try:
-        content = await file.read()
-        image = Image.open(io.BytesIO(content))
-        if image.mode not in ("L", "RGB", "RGBA"):
-            image = image.convert("RGB")
-
+        image = _open_uploaded_image(file)
         ocr_result = ocr_engine.recognize_image(image, source_lang=source_lang)
         source_text = (ocr_result.get("text") or "").strip()
         if not source_text:
@@ -250,8 +280,7 @@ def recognize_and_translate_blocks(
     source_lang: Optional[str] = Form(None),
 ):
     """OCR + per-line translation with bounding boxes for the screenshot overlay."""
-    if not (file.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=400, detail="Must be an image file")
+    _require_image_content_type(file)
     try:
         normalize_target_language(target_lang)
         normalize_source_language(source_lang)
@@ -261,11 +290,7 @@ def recognize_and_translate_blocks(
         raise HTTPException(status_code=503, detail="Translator model is loading or not ready.")
 
     try:
-        content = file.file.read()
-        image = Image.open(io.BytesIO(content))
-        if image.mode not in ("L", "RGB", "RGBA"):
-            image = image.convert("RGB")
-
+        image = _open_uploaded_image(file)
         ocr_result = ocr_engine.recognize_image(image, source_lang=source_lang)
         return _translate_line_boxes(
             ocr_result.get("line_boxes") or [],
