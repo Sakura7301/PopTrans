@@ -4,6 +4,16 @@
 
 ---
 
+## [v1.7.1] - 2026-11-17
+
+### 🩹 修复 (Fixed)
+
+- **离线设备启动报「required Wails UI translate-ui.exe not found」**：单文件发行版此前把 UI/引擎解压到共享的 `%LOCALAPPDATA%\PopTrans\runtime`，当旧版 PopTrans 的 UI 守护进程仍在运行（或文件被占用/只读）时，新版覆盖 `translate-ui.exe` 会失败，随后找不到 UI。现在每个 buildID 使用独立的 `runtime\<buildID>` 目录，绝不覆盖旧版本正在使用的文件；版本目录不可写时再回退到进程级目录和程序目录。
+- 解压失败时不再只提示「not found」，会显示底层错误，并提示先完全退出旧版 PopTrans、检查杀毒软件是否拦截了 runtime 目录。
+- 新增离线部署说明：在有网设备下载好 `Hy-MT2-1.8B-Q4_K_M.gguf` 后，把 `models\Hy-MT2-1.8B-GGUF\` 随 `PopTrans.exe` 一起复制到无网设备即可，不需要复制或使用旧的 `runtime` 目录。
+
+---
+
 ## [v1.7.0] - 2026-11-13
 
 ### ✨ 新增与变更 (Added & Changed)

@@ -75,6 +75,9 @@ type App struct {
 	overlayUI        *uidaemon.Manager
 	uiPath           string
 	enginePath       string
+	// uiErr keeps the bundled-runtime extraction error so Run can surface an
+	// actionable message instead of the generic "translate-ui.exe not found".
+	uiErr            error
 	hotkeysSuspended bool
 	// autostart marks a login-triggered launch (--autostart): warm the AI
 	// engine in the background but skip the startup UI window so the process
@@ -152,6 +155,7 @@ func New() (*App, error) {
 		supervisor:         supervisor,
 		uiPath:             runtimePaths.UIPath,
 		enginePath:         runtimePaths.EnginePath,
+		uiErr:              bundleErr,
 		status:             "正在初始化...",
 		backendIdleTimeout: cfg.AIIdleTimeout(),
 		autostart:          hasArg("--autostart"),
@@ -175,7 +179,14 @@ func (a *App) Run() error {
 	currentApp = a
 	log.Printf("app run start")
 	if a.resolveWailsExe() == "" {
-		return errors.New("required Wails UI translate-ui.exe not found")
+		runtimeHint := filepath.Join(a.baseDir, runtimebundle.DirName)
+		if local := os.Getenv("LOCALAPPDATA"); local != "" {
+			runtimeHint = filepath.Join(local, "PopTrans", runtimebundle.DirName)
+		}
+		if a.uiErr != nil {
+			return fmt.Errorf("无法准备内置界面 translate-ui.exe：%w\n\n请先完全退出托盘中的旧版 PopTrans 后重试。若仍失败，请检查杀毒软件是否拦截了：\n%s", a.uiErr, runtimeHint)
+		}
+		return fmt.Errorf("未找到内置界面 translate-ui.exe。请先完全退出托盘中的旧版 PopTrans 后重试；若仍失败，请检查杀毒软件是否拦截了：\n%s", runtimeHint)
 	}
 
 	if err := win.RegisterClass(mainWindowClass, mainWndProc); err != nil {
