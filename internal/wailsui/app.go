@@ -32,10 +32,11 @@ const (
 )
 
 type App struct {
-	ctx        context.Context
-	baseDir    string
-	client     *backend.Client
-	supervisor *backend.Supervisor
+	ctx           context.Context
+	baseDir       string
+	client        *backend.Client
+	clientBaseURL string
+	supervisor    *backend.Supervisor
 
 	daemonMode    bool
 	overlayMode   bool
@@ -57,6 +58,8 @@ type App struct {
 	startupStatus  string
 	startupError   string
 	startupStarted time.Time
+	monitorRunning bool
+	lastWakeSent   time.Time
 	idleTimer      *time.Timer
 	idleTimeout    time.Duration
 
@@ -245,7 +248,8 @@ func NewApp(baseDir string, launch LaunchOptions) *App {
 	if err != nil {
 		cfg = config.Default
 	}
-	client := backend.NewClient(config.BackendURL(cfg.ServerPort))
+	baseURL := config.BackendURL(cfg.ServerPort)
+	client := backend.NewClient(baseURL)
 	mode := "settings"
 	if launch.Overlay {
 		mode = "overlay"
@@ -253,6 +257,7 @@ func NewApp(baseDir string, launch LaunchOptions) *App {
 	app := &App{
 		baseDir:       baseDir,
 		client:        client,
+		clientBaseURL: baseURL,
 		supervisor:    backend.NewSupervisor(baseDir, client),
 		endpointDir:   launch.EndpointDir,
 		windowTitle:   "选中翻译",
@@ -328,7 +333,7 @@ func (a *App) Startup(ctx context.Context) {
 		a.mu.Unlock()
 		// The host process starts the backend. Poll its health here so the UI can
 		// show download/load progress without racing a second backend process.
-		go a.monitorStartup()
+		a.ensureStartupMonitor()
 		go a.applyWindowAppearance()
 		return
 	}
@@ -667,7 +672,60 @@ func (a *App) SetOverlayPinned(pinned bool) {
 	}
 }
 
+func (a *App) backendClient() *backend.Client {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.client
+}
+
+func (a *App) syncBackendClientPort(port int) {
+	targetURL := config.BackendURL(port)
+	a.mu.Lock()
+	if a.clientBaseURL != targetURL {
+		a.client = backend.NewClient(targetURL)
+		a.clientBaseURL = targetURL
+	}
+	a.mu.Unlock()
+}
+
+func (a *App) ensureStartupMonitor() {
+	a.mu.Lock()
+	if a.monitorRunning || a.ctx == nil {
+		a.mu.Unlock()
+		return
+	}
+	a.monitorRunning = true
+	a.mu.Unlock()
+	go a.monitorStartup()
+}
+
+func (a *App) notifyWakeBackend() {
+	if a.notify == nil {
+		return
+	}
+	a.mu.Lock()
+	if time.Since(a.lastWakeSent) < 3*time.Second {
+		a.mu.Unlock()
+		return
+	}
+	a.lastWakeSent = time.Now()
+	a.mu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := a.notify.WakeBackend(ctx); err != nil {
+			log.Printf("notify wake backend failed: %v", err)
+		}
+	}()
+}
+
 func (a *App) monitorStartup() {
+	defer func() {
+		a.mu.Lock()
+		a.monitorRunning = false
+		a.mu.Unlock()
+	}()
 	ctx := a.ctx
 	if ctx == nil {
 		return
@@ -680,7 +738,7 @@ func (a *App) monitorStartup() {
 	for {
 		select {
 		case <-ticker.C:
-			health, err := a.client.Health(ctx)
+			health, err := a.backendClient().Health(ctx)
 			a.mu.Lock()
 			if err != nil {
 				failures++
@@ -691,6 +749,7 @@ func (a *App) monitorStartup() {
 				}
 			} else {
 				failures = 0
+				a.startupError = ""
 				if health.TranslatorStatus != "" {
 					a.startupStatus = health.TranslatorStatus
 				} else if !health.TranslatorReady {
@@ -845,9 +904,28 @@ func (a *App) State() (UIState, error) {
 		// Keep the first paint fast even when the engine is still booting; the
 		// frontend polls again and the header/banner update in place.
 		healthCtx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
-		health, _ := a.client.Health(healthCtx)
+		health, healthErr := a.backendClient().Health(healthCtx)
 		cancel()
 		state.Health = health
+		if healthErr == nil {
+			a.mu.Lock()
+			state.StartupStatus = a.startupStatus
+			state.StartupError = a.startupError
+			a.mu.Unlock()
+		} else {
+			a.mu.Lock()
+			if a.startupStatus == "" || a.startupStatus == "引擎就绪" || a.startupStatus == "模型加载完成" {
+				a.startupStatus = "正在连接本地服务..."
+			}
+			state.StartupStatus = a.startupStatus
+			state.StartupError = a.startupError
+			shouldWake := a.daemonMode && a.visible
+			a.mu.Unlock()
+			if shouldWake {
+				a.ensureStartupMonitor()
+				a.notifyWakeBackend()
+			}
+		}
 	}
 	return state, nil
 }
@@ -859,6 +937,7 @@ func (a *App) SaveConfig(cfg config.Config) error {
 	if err := config.Save(a.baseDir, cfg); err != nil {
 		return err
 	}
+	a.syncBackendClientPort(cfg.ServerPort)
 	a.notifyConfigSaved()
 	return nil
 }
@@ -1115,7 +1194,7 @@ func (a *App) Translate(text string) (TranslateResult, error) {
 
 	sourceLang, targetLang := a.languagePair()
 	startedAt := time.Now()
-	result, err := a.client.TranslateWithLanguages(ctx, text, sourceLang, targetLang)
+	result, err := a.backendClient().TranslateWithLanguages(ctx, text, sourceLang, targetLang)
 	latency := time.Since(startedAt).Milliseconds()
 	if err != nil {
 		return TranslateResult{}, err
@@ -1163,7 +1242,7 @@ func (a *App) OCRTranslateImage(imageData string) (TranslateResult, error) {
 
 	sourceLang, targetLang := a.languagePair()
 	startedAt := time.Now()
-	result, err := a.client.OCRTranslateImageWithLanguages(ctx, decoded, sourceLang, targetLang)
+	result, err := a.backendClient().OCRTranslateImageWithLanguages(ctx, decoded, sourceLang, targetLang)
 	latency := time.Since(startedAt).Milliseconds()
 	if err != nil {
 		return TranslateResult{}, err

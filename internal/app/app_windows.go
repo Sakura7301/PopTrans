@@ -114,10 +114,16 @@ type App struct {
 
 	backendIdleMu      sync.Mutex
 	backendIdleUsers   int
+	backendIdleGen     uint64
 	backendIdleTimer   *time.Timer
 	backendIdleTimeout time.Duration
+	mainWindowOpen     bool
+	backendStopping    bool
+	backendStopDone    chan struct{}
+	backendStopHook    func()
 
 	startupCancelMu sync.Mutex
+	startupRunning  bool
 	startupCancel   context.CancelFunc
 }
 
@@ -367,15 +373,21 @@ func (a *App) resumeHotkeys() error {
 }
 
 func (a *App) ensureBackendReady() {
-	log.Printf("app ensure backend ready start")
-	ctx, cancel := context.WithTimeout(context.Background(), backend.StartupReadyTimeout)
-	defer cancel()
-
 	a.startupCancelMu.Lock()
+	if a.startupRunning {
+		a.startupCancelMu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), backend.StartupReadyTimeout)
+	a.startupRunning = true
 	a.startupCancel = cancel
 	a.startupCancelMu.Unlock()
+
+	log.Printf("app ensure backend ready start")
+	defer cancel()
 	defer func() {
 		a.startupCancelMu.Lock()
+		a.startupRunning = false
 		a.startupCancel = nil
 		a.startupCancelMu.Unlock()
 	}()
@@ -1970,13 +1982,14 @@ func (a *App) openTranslate() {
 }
 
 func (a *App) showWailsTranslate() error {
+	go a.ensureBackendReady()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := a.ui.ShowTranslate(ctx); err != nil {
 		return err
 	}
+	a.setMainWindowOpen(true)
 	log.Printf("app wake ai engine after translate opened")
-	go a.ensureBackendReady()
 	return nil
 }
 
@@ -1990,16 +2003,17 @@ func (a *App) openSettings() {
 }
 
 func (a *App) showWailsSettings() error {
+	go a.ensureBackendReady()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := a.ui.ShowSettings(ctx); err != nil {
 		return err
 	}
+	a.setMainWindowOpen(true)
 	// 设置弹窗会展示引擎状态徽标。若 AI 引擎正处于休眠（空闲自动回收），
 	// 这里必须像翻译/OCR 一样主动拉起，否则徽标会一直停在“正在启动”的
 	// 加载动画上，因为没有任何路径去唤醒引擎。
 	log.Printf("app wake ai engine after settings opened")
-	go a.ensureBackendReady()
 	return nil
 }
 
@@ -2215,13 +2229,19 @@ func (a *App) withBackend(ctx context.Context, onStatus func(string), fn func(co
 
 func (a *App) beginBackendUse() {
 	a.backendIdleMu.Lock()
-	defer a.backendIdleMu.Unlock()
-
+	for a.backendStopping {
+		done := a.backendStopDone
+		a.backendIdleMu.Unlock()
+		<-done
+		a.backendIdleMu.Lock()
+	}
 	a.backendIdleUsers++
+	a.backendIdleGen++
 	if a.backendIdleTimer != nil {
 		a.backendIdleTimer.Stop()
 		a.backendIdleTimer = nil
 	}
+	a.backendIdleMu.Unlock()
 }
 
 func (a *App) endBackendUse() {
@@ -2229,29 +2249,15 @@ func (a *App) endBackendUse() {
 	if a.backendIdleUsers > 0 {
 		a.backendIdleUsers--
 	}
-	shouldSchedule := a.backendIdleUsers == 0
-	timeout := a.backendIdleTimeout
-	if !shouldSchedule || timeout <= 0 {
-		a.backendIdleMu.Unlock()
-		if shouldSchedule && timeout <= 0 {
-			log.Printf("backend idle auto-stop disabled")
-		}
-		return
-	}
-	if a.backendIdleTimer != nil {
-		a.backendIdleTimer.Stop()
-	}
-	a.backendIdleTimer = time.AfterFunc(timeout, func() {
-		a.stopBackendForIdleTimeout(timeout)
-	})
+	a.scheduleBackendIdleLocked()
 	a.backendIdleMu.Unlock()
-	log.Printf("backend idle auto-stop scheduled in %s", timeout)
 }
 
 func (a *App) cancelBackendIdleStop() {
 	a.backendIdleMu.Lock()
 	defer a.backendIdleMu.Unlock()
 
+	a.backendIdleGen++
 	if a.backendIdleTimer != nil {
 		a.backendIdleTimer.Stop()
 		a.backendIdleTimer = nil
@@ -2261,39 +2267,77 @@ func (a *App) cancelBackendIdleStop() {
 func (a *App) setBackendIdleTimeout(timeout time.Duration) {
 	a.backendIdleMu.Lock()
 	a.backendIdleTimeout = timeout
-	idle := a.backendIdleUsers == 0
+	a.scheduleBackendIdleLocked()
+	a.backendIdleMu.Unlock()
+}
+
+func (a *App) setMainWindowOpen(open bool) {
+	a.backendIdleMu.Lock()
+	a.mainWindowOpen = open
+	if open {
+		a.backendIdleGen++
+		if a.backendIdleTimer != nil {
+			a.backendIdleTimer.Stop()
+			a.backendIdleTimer = nil
+		}
+		a.backendIdleMu.Unlock()
+		return
+	}
+	a.scheduleBackendIdleLocked()
+	a.backendIdleMu.Unlock()
+}
+
+func (a *App) scheduleBackendIdleLocked() {
 	if a.backendIdleTimer != nil {
 		a.backendIdleTimer.Stop()
 		a.backendIdleTimer = nil
 	}
-	if !idle || timeout <= 0 {
-		a.backendIdleMu.Unlock()
-		if timeout <= 0 {
-			log.Printf("backend idle auto-stop disabled")
-		}
+	a.backendIdleGen++
+	if a.backendIdleUsers != 0 || a.mainWindowOpen {
 		return
 	}
+	timeout := a.backendIdleTimeout
+	if timeout <= 0 {
+		log.Printf("backend idle auto-stop disabled")
+		return
+	}
+	gen := a.backendIdleGen
 	a.backendIdleTimer = time.AfterFunc(timeout, func() {
-		a.stopBackendForIdleTimeout(timeout)
+		a.stopBackendForIdleTimeout(gen, timeout)
 	})
-	a.backendIdleMu.Unlock()
-	log.Printf("backend idle auto-stop rescheduled in %s", timeout)
+	log.Printf("backend idle auto-stop scheduled in %s", timeout)
 }
 
-func (a *App) stopBackendForIdleTimeout(timeout time.Duration) {
+func (a *App) stopBackendForIdleTimeout(gen uint64, timeout time.Duration) {
 	a.backendIdleMu.Lock()
-	if a.backendIdleUsers != 0 {
-		a.backendIdleTimer = nil
+	if a.backendIdleGen != gen || a.backendIdleUsers != 0 || a.mainWindowOpen || a.backendStopping {
 		a.backendIdleMu.Unlock()
-		log.Printf("backend idle stop skipped: backend became busy again")
+		log.Printf("backend idle stop skipped: state changed or backend busy")
 		return
 	}
 	a.backendIdleTimer = nil
+	a.backendStopping = true
+	done := make(chan struct{})
+	a.backendStopDone = done
+	stopFn := a.backendStopHook
 	a.backendIdleMu.Unlock()
 
 	log.Printf("backend idle timeout reached (%s), stopping ai engine", timeout)
-	a.supervisor.Stop()
-	a.setStatus("AI 引擎已休眠")
+	if stopFn != nil {
+		stopFn()
+	} else if a.supervisor != nil {
+		a.supervisor.Stop()
+	}
+
+	a.backendIdleMu.Lock()
+	a.backendStopping = false
+	a.backendStopDone = nil
+	close(done)
+	a.backendIdleMu.Unlock()
+
+	if a.hwnd != 0 {
+		a.setStatus("AI 引擎已休眠")
+	}
 }
 
 func (a *App) showTranslation() {
@@ -2354,11 +2398,12 @@ func (a *App) showWailsResult(source, result, errMsg string, loading bool) error
 
 func (a *App) handleUIDaemonEvent(event int) {
 	switch event {
-	case uidaemon.EventSettingsHidden, uidaemon.EventConfigSaved:
-		win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
-	case uidaemon.EventUIExited:
+	case uidaemon.EventSettingsHidden, uidaemon.EventUIExited:
+		a.setMainWindowOpen(false)
 		// Always re-post: resumeHotkeys is idempotent, and reading the flag on
 		// this goroutine would race the window thread.
+		win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
+	case uidaemon.EventConfigSaved:
 		win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
 	case uidaemon.EventHotkeyPause:
 		win.PostMessage(a.hwnd, wmHotkeyPause, 0, 0)
@@ -2376,6 +2421,8 @@ func (a *App) handleUIDaemonEvent(event int) {
 		win.PostMessage(a.hwnd, wmLiveStop, 0, 0)
 	case uidaemon.EventLiveRefresh:
 		win.PostMessage(a.hwnd, wmLiveRefresh, 0, 0)
+	case uidaemon.EventWakeBackend:
+		go a.ensureBackendReady()
 	}
 }
 

@@ -66,8 +66,17 @@ func (s *CallbackServer) Start() (url, token string, err error) {
 		}
 		writeJSON(w, map[string]any{"ok": true})
 	}))
-	mux.HandleFunc(EndpointNotifyHotkeyHold, s.withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(EndpointNotifyWakeBackend, s.withAuth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if s.onEvent != nil {
+			s.onEvent(EventWakeBackend)
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	}))
+	mux.HandleFunc(EndpointNotifyHotkeyHold, s.withAuth(func(w http.ResponseWriter, r *http.Request) {		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -200,6 +209,11 @@ func (c *NotifyClient) ConfigSaved(ctx context.Context) error {
 // them, so they must be unregistered during recording.
 func (c *NotifyClient) HotkeyHold(ctx context.Context, paused bool) error {
 	return c.post(ctx, EndpointNotifyHotkeyHold, HotkeyHoldPayload{Paused: paused})
+}
+
+// WakeBackend asks the host process to ensure the AI backend is started.
+func (c *NotifyClient) WakeBackend(ctx context.Context) error {
+	return c.post(ctx, EndpointNotifyWakeBackend, map[string]any{"ok": true})
 }
 
 func (c *NotifyClient) OverlayClosed(ctx context.Context) error {

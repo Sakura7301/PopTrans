@@ -30,17 +30,23 @@ const serverPortEnv = "TRANSLATE_SERVER_PORT"
 // 仅当发生真正的初始化错误（如下载彻底失败）或后端进程退出时，才会提前返回错误。
 const StartupReadyTimeout = 30 * time.Minute
 
+var errOwnedProcessExited = errors.New("api server exited before ready")
+
 type Supervisor struct {
 	baseDir    string
 	client     *Client
 	enginePath string
 
-	mu         sync.Mutex
-	cmd        *exec.Cmd
-	owned      bool
-	waitCh     chan error
-	stopCtx    context.Context
-	stopCancel context.CancelFunc
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	owned          bool
+	waitCh         chan error
+	stopCtx        context.Context
+	stopCancel     context.CancelFunc
+	stopping       bool
+	stopDone       chan struct{}
+	commandFactory func() (*exec.Cmd, string, error)
+	sweepHook      func()
 }
 
 func NewSupervisor(baseDir string, client *Client) *Supervisor {
@@ -58,18 +64,69 @@ func (s *Supervisor) SetEnginePath(path string) {
 	s.enginePath = path
 }
 
+func (s *Supervisor) waitWhileStoppingLocked(ctx context.Context) error {
+	for s.stopping {
+		done := s.stopDone
+		s.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		s.mu.Lock()
+	}
+	return nil
+}
+
+func isWaitChannelClosed(waitCh <-chan error) bool {
+	if waitCh == nil {
+		return true
+	}
+	select {
+	case <-waitCh:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) error {
+	for attempt := 0; attempt < 2; attempt++ {
+		err := s.ensureRunningOnce(ctx, onStatus)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, errOwnedProcessExited) && attempt == 0 {
+			log.Printf("supervisor attached process exited, retrying fresh start: %v", err)
+			continue
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Supervisor) ensureRunningOnce(ctx context.Context, onStatus func(string)) error {
 	s.mu.Lock()
+	if err := s.waitWhileStoppingLocked(ctx); err != nil {
+		return err
+	}
 	stopCtx := s.stopCtx
 	if stopCtx.Err() != nil {
 		s.mu.Unlock()
 		return errors.New("backend supervisor is stopped")
 	}
 
-	// 若已有由 supervisor 管理且活着的进程，直接等待就绪
+	// 若已有由 supervisor 管理且活着的进程，直接等待就绪；若已退出则清理后重建
 	if s.cmd != nil && s.owned && s.cmd.Process != nil {
-		s.mu.Unlock()
-		return s.waitForReady(ctx, stopCtx, onStatus)
+		if isWaitChannelClosed(s.waitCh) {
+			s.cmd = nil
+			s.owned = false
+			s.waitCh = nil
+		} else {
+			waitCh := s.waitCh
+			s.mu.Unlock()
+			return s.waitForReady(ctx, stopCtx, waitCh, onStatus)
+		}
 	}
 	s.mu.Unlock()
 
@@ -101,30 +158,49 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 
 	if shouldStart {
 		s.mu.Lock()
-		if s.stopCtx.Err() != nil {
+		if err := s.waitWhileStoppingLocked(ctx); err != nil {
+			return err
+		}
+		stopCtx = s.stopCtx
+		if stopCtx.Err() != nil {
 			s.mu.Unlock()
 			return errors.New("backend supervisor is stopped")
 		}
 		if s.cmd != nil && s.owned && s.cmd.Process != nil {
-			s.mu.Unlock()
-			return s.waitForReady(ctx, s.stopCtx, onStatus)
+			if isWaitChannelClosed(s.waitCh) {
+				s.cmd = nil
+				s.owned = false
+				s.waitCh = nil
+			} else {
+				waitCh := s.waitCh
+				s.mu.Unlock()
+				return s.waitForReady(ctx, stopCtx, waitCh, onStatus)
+			}
 		}
 
 		onStatus("starting local api service...")
 
-		cmd, backendName, err := s.backendCommand()
+		factory := s.commandFactory
+		if factory == nil {
+			factory = s.backendCommand
+		}
+		cmd, backendName, err := factory()
 		if err != nil {
 			s.mu.Unlock()
 			return err
 		}
-		cmd.Dir = s.baseDir
+		if cmd.Dir == "" {
+			cmd.Dir = s.baseDir
+		}
 		// 捕获选中文本时前端会模拟发送 Ctrl+C。若后端与前端共享控制台进程组，
 		// 该 Ctrl+C 会被控制台解释为 CTRL_C_EVENT 广播给整个进程组，
 		// 使后端被终止（退出码 0xC000013A / STATUS_CONTROL_C_EXIT）。
 		// 用 CREATE_NO_WINDOW 让后端脱离前端控制台，彻底隔离该信号。
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			HideWindow:    true,
-			CreationFlags: createNoWindow,
+		if cmd.SysProcAttr == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{
+				HideWindow:    true,
+				CreationFlags: createNoWindow,
+			}
 		}
 
 		var backendLogFile *os.File
@@ -134,7 +210,11 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 		if cfgErr == nil {
 			serverPort = cfg.ServerPort
 		}
-		cmd.Env = environmentWith(os.Environ(), serverPortEnv, strconv.Itoa(serverPort))
+		baseEnv := cmd.Env
+		if baseEnv == nil {
+			baseEnv = os.Environ()
+		}
+		cmd.Env = environmentWith(baseEnv, serverPortEnv, strconv.Itoa(serverPort))
 		// Frozen engines may live in <baseDir>/runtime; tell them where the
 		// real settings/models directory is.
 		cmd.Env = environmentWith(cmd.Env, "POPTRANS_BASE_DIR", s.baseDir)
@@ -181,16 +261,25 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 			} else {
 				log.Printf("supervisor backend process exited cleanly: pid=%d", cmd.Process.Pid)
 			}
+			s.mu.Lock()
+			if s.cmd == cmd {
+				s.cmd = nil
+				s.owned = false
+				s.waitCh = nil
+			}
+			s.mu.Unlock()
 			waitCh <- waitErr
 			close(waitCh)
 		}()
 		s.mu.Unlock()
+
+		return s.waitForReady(ctx, stopCtx, waitCh, onStatus)
 	}
 
-	return s.waitForReady(ctx, stopCtx, onStatus)
+	return s.waitForReady(ctx, stopCtx, nil, onStatus)
 }
 
-func (s *Supervisor) waitForReady(ctx, stopCtx context.Context, onStatus func(string)) error {
+func (s *Supervisor) waitForReady(ctx, stopCtx context.Context, waitCh <-chan error, onStatus func(string)) error {
 	deadline := time.Now().Add(StartupReadyTimeout)
 	attempt := 0
 	for time.Now().Before(deadline) {
@@ -206,24 +295,15 @@ func (s *Supervisor) waitForReady(ctx, stopCtx context.Context, onStatus func(st
 		default:
 		}
 
-		s.mu.Lock()
-		waitCh := s.waitCh
-		s.mu.Unlock()
-
 		if waitCh != nil {
 			select {
 			case waitErr, ok := <-waitCh:
-				s.mu.Lock()
-				s.waitCh = nil
-				s.cmd = nil
-				s.owned = false
-				s.mu.Unlock()
 				if ok && waitErr != nil {
 					log.Printf("supervisor detected backend exit before ready on attempt %d: %v", attempt, waitErr)
-					return fmt.Errorf("api server exited before ready: %w", waitErr)
+					return fmt.Errorf("%w: %v", errOwnedProcessExited, waitErr)
 				}
 				log.Printf("supervisor detected backend exit before ready on attempt %d", attempt)
-				return fmt.Errorf("api server exited before ready")
+				return errOwnedProcessExited
 			default:
 			}
 		}
@@ -310,6 +390,16 @@ func translatorInitializationError(health Health) error {
 
 func (s *Supervisor) Stop() {
 	s.mu.Lock()
+	for s.stopping {
+		done := s.stopDone
+		s.mu.Unlock()
+		<-done
+		s.mu.Lock()
+	}
+	s.stopping = true
+	done := make(chan struct{})
+	s.stopDone = done
+
 	if s.stopCancel != nil {
 		s.stopCancel()
 	}
@@ -319,7 +409,7 @@ func (s *Supervisor) Stop() {
 	s.cmd = nil
 	s.owned = false
 	s.waitCh = nil
-	s.stopCtx, s.stopCancel = context.WithCancel(context.Background())
+	sweep := s.sweepHook
 	s.mu.Unlock()
 
 	if cmd != nil && owned && cmd.Process != nil {
@@ -342,7 +432,18 @@ func (s *Supervisor) Stop() {
 	// 兜底清理：启动时若发现已有后端在运行（来自上一次未干净退出的遗留进程），
 	// EnsureRunning 会直接复用而不会接管其生命周期，导致本次退出时无法回收。
 	// 这里按可执行文件路径扫一遍 baseDir 下的 ai_engine.exe，确保退出后无残留。
-	s.killEngineByPath()
+	if sweep != nil {
+		sweep()
+	} else {
+		s.killEngineByPath()
+	}
+
+	s.mu.Lock()
+	s.stopCtx, s.stopCancel = context.WithCancel(context.Background())
+	s.stopping = false
+	s.stopDone = nil
+	close(done)
+	s.mu.Unlock()
 }
 
 func (s *Supervisor) waitForOwnedExit() {

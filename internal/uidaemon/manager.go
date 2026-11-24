@@ -36,6 +36,8 @@ const (
 	EventOverlayRefresh = 10
 	// EventLiveRefresh re-runs OCR + translation for the current live frame.
 	EventLiveRefresh = 11
+	// EventWakeBackend requests the host to ensure the AI backend is running.
+	EventWakeBackend = 12
 
 	processQueryLimitedInformation = 0x1000
 	stillActive                    = 259
@@ -119,7 +121,7 @@ func (m *Manager) EnsureReady(ctx context.Context) error {
 	return m.startProcess(ctx)
 }
 
-func (m *Manager) ShowSettings(ctx context.Context) error {
+func (m *Manager) callWithRetry(ctx context.Context, fn func(*Client) error) error {
 	if err := m.EnsureReady(ctx); err != nil {
 		return err
 	}
@@ -127,29 +129,42 @@ func (m *Manager) ShowSettings(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return client.ShowSettings(ctx)
+	err = fn(client)
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	m.mu.Lock()
+	if m.client == client {
+		m.resetClientLocked()
+	}
+	m.mu.Unlock()
+
+	if retryErr := m.EnsureReady(ctx); retryErr != nil {
+		return retryErr
+	}
+	client, err = m.currentClient()
+	if err != nil {
+		return err
+	}
+	return fn(client)
+}
+
+func (m *Manager) ShowSettings(ctx context.Context) error {
+	return m.callWithRetry(ctx, func(client *Client) error {
+		return client.ShowSettings(ctx)
+	})
 }
 
 func (m *Manager) ShowTranslate(ctx context.Context) error {
-	if err := m.EnsureReady(ctx); err != nil {
-		return err
-	}
-	client, err := m.currentClient()
-	if err != nil {
-		return err
-	}
-	return client.ShowTranslate(ctx)
+	return m.callWithRetry(ctx, func(client *Client) error {
+		return client.ShowTranslate(ctx)
+	})
 }
 
 func (m *Manager) ShowResult(ctx context.Context, payload ResultPayload) error {
-	if err := m.EnsureReady(ctx); err != nil {
-		return err
-	}
-	client, err := m.currentClient()
-	if err != nil {
-		return err
-	}
-	return client.ShowResult(ctx, payload)
+	return m.callWithRetry(ctx, func(client *Client) error {
+		return client.ShowResult(ctx, payload)
+	})
 }
 
 func (m *Manager) ShowOverlay(ctx context.Context, payload OverlayPayload) error {

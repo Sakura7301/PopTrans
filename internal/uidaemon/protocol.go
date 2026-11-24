@@ -31,6 +31,7 @@ const (
 	EndpointNotifyOverlayClosed   = "/notify/overlay-closed"
 	EndpointNotifyOverlayRefresh  = "/notify/overlay-refresh"
 	EndpointNotifyLiveControl     = "/notify/live-control"
+	EndpointNotifyWakeBackend     = "/notify/wake-backend"
 
 	headerToken = "X-PopTrans-Token"
 )
